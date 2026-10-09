@@ -1,0 +1,41 @@
+{
+  "realm": "lab",
+  "enabled": true,
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@lab.local",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Lab",
+      "credentials": [{ "type": "password", "value": "alice", "temporary": false }]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "foo",
+      "secret": "foo-secret",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://foo.localhost:3001/callback"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://foo.localhost:3001/*"
+      }
+    },
+    {
+      "clientId": "bar",
+      "secret": "bar-secret",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://bar.localhost:3002/callback"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://bar.localhost:3002/*"
+      }
+    }
+  ]
+}
