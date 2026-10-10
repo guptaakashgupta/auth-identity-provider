@@ -2,13 +2,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -21,7 +24,8 @@ import (
 
 type session struct {
 	claims  map[string]any
-	idToken string // kept for id_token_hint on logout
+	idToken string        // kept for id_token_hint on logout
+	tok     *oauth2.Token // access + refresh token, used to call the API
 }
 
 // ponytail: in-memory sessions, lost on restart; use Redis/DB if it matters.
@@ -36,6 +40,8 @@ func main() {
 	secret := flag.String("secret", "foo-secret", "client secret")
 	peer := flag.String("peer", "http://bar.localhost:3002", "the other app, for the demo link")
 	issuer := flag.String("issuer", "http://localhost:8080/realms/lab", "OIDC issuer URL")
+	scopes := flag.String("scopes", "", "extra space-separated scopes to request, e.g. orders:read")
+	api := flag.String("api", "http://localhost:4000", "resource server base URL")
 	flag.Parse()
 
 	base := fmt.Sprintf("http://%s.localhost:%s", *name, *port)
@@ -58,7 +64,7 @@ func main() {
 		ClientSecret: *secret,
 		Endpoint:     provider.Endpoint(),
 		RedirectURL:  base + "/callback",
-		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+		Scopes:       append([]string{oidc.ScopeOpenID, "profile", "email"}, strings.Fields(*scopes)...),
 	}
 	verifier := provider.Verifier(&oidc.Config{ClientID: *name})
 
@@ -74,9 +80,13 @@ func main() {
 		}
 		claims, _ := json.MarshalIndent(s.claims, "", "  ")
 		fmt.Fprintf(w, `<p>Logged in as <b>%s</b></p><pre>%s</pre>
-<p><a href="%s">Go to the other app</a> | <a href="/logout">Logout</a></p>`,
+<p><a href="%s">Go to the other app</a> | <a href="/logout">Logout</a></p>
+<h2>Access token (for the API, not for %s)</h2><p>Expires %s</p><pre>%s</pre>
+<form method="post" action="/call-api">Call the API: <button name="method" value="GET">GET /orders</button>
+<button name="method" value="POST">POST /orders</button></form>`,
 			html.EscapeString(fmt.Sprint(s.claims["preferred_username"])),
-			html.EscapeString(string(claims)), html.EscapeString(*peer))
+			html.EscapeString(string(claims)), html.EscapeString(*peer),
+			html.EscapeString(*name), s.tok.Expiry.Format("15:04:05"), html.EscapeString(peek(s.tok.AccessToken)))
 	})
 
 	// Step 1: send the browser to the IdP with state (CSRF) and a PKCE challenge.
@@ -101,6 +111,10 @@ func main() {
 		}
 		setTemp(w, "state", "")
 		setTemp(w, "pkce", "")
+		if e := r.URL.Query().Get("error"); e != "" {
+			http.Error(w, "IdP returned "+e+": "+r.URL.Query().Get("error_description"), http.StatusBadRequest)
+			return
+		}
 		tok, err := conf.Exchange(r.Context(), r.URL.Query().Get("code"), oauth2.VerifierOption(pkce.Value))
 		if err != nil {
 			http.Error(w, "code exchange failed: "+err.Error(), http.StatusBadGateway)
@@ -125,10 +139,57 @@ func main() {
 
 		sid := randomID()
 		mu.Lock()
-		sessions[sid] = session{claims: claims, idToken: raw}
+		sessions[sid] = session{claims: claims, idToken: raw, tok: tok}
 		mu.Unlock()
 		http.SetCookie(w, &http.Cookie{Name: "sid", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		http.Redirect(w, r, "/", http.StatusFound)
+	})
+
+	// Calls the API as the logged-in user by sending the access token as a bearer token.
+	mux.HandleFunc("POST /call-api", func(w http.ResponseWriter, r *http.Request) {
+		s, ok := current(r)
+		if !ok {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		method := http.MethodGet
+		if r.FormValue("method") == http.MethodPost {
+			method = http.MethodPost
+		}
+		// TokenSource returns the stored token, or uses the refresh token to get a
+		// new one once the access token is within 10s of expiry.
+		t, err := conf.TokenSource(r.Context(), s.tok).Token()
+		if err != nil {
+			http.Error(w, "refresh failed (IdP session ended?), log in again: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+		refreshed := t.AccessToken != s.tok.AccessToken
+		if c, err := r.Cookie("sid"); err == nil {
+			mu.Lock()
+			s.tok = t
+			sessions[c.Value] = s
+			mu.Unlock()
+		}
+
+		req, err := http.NewRequestWithContext(r.Context(), method, *api+"/orders", nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+t.AccessToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, "api unreachable (is make api running?): "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<h1>%s calls the API</h1><p>Access token refreshed for this call: <b>%v</b></p>
+<p>%s %s/orders &rarr; <b>%s</b></p><pre>WWW-Authenticate: %s</pre><pre>%s</pre><a href="/">Back</a>`,
+			html.EscapeString(*name), refreshed, method, html.EscapeString(*api), html.EscapeString(resp.Status),
+			html.EscapeString(resp.Header.Get("WWW-Authenticate")), html.EscapeString(string(body)))
 	})
 
 	// Clears the local session and ends the IdP session (RP-initiated logout).
@@ -180,6 +241,24 @@ func setTemp(w http.ResponseWriter, name, value string) {
 		maxAge = -1
 	}
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", MaxAge: maxAge, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+}
+
+// peek decodes a JWT payload WITHOUT verifying it, for display only. A client
+// should treat the access token as opaque; the API is the one that verifies it.
+func peek(jwt string) string {
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		return "(not a JWT)"
+	}
+	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "(undecodable payload)"
+	}
+	var out bytes.Buffer
+	if json.Indent(&out, b, "", "  ") != nil {
+		return string(b)
+	}
+	return out.String()
 }
 
 func randomID() string {
